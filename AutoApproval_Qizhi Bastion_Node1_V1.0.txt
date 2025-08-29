@@ -1,0 +1,127 @@
+'''
+This script can approve Fortress ticket automaticly
+Rejcet if the usage time exceeds one day
+Author:Terrence
+'''
+import requests
+import re
+from datetime import datetime
+import time
+import urllib3
+from requests import Timeout
+def login():
+        #访问api接口登录并拿到cookie，这个cookie在以后每次访问其他所有api接口时都要添加到headers中，10分钟内没有任何接口调用，cookie失效，需要重新登录
+        global token
+        login_api_url = 'https://172.27.57.105/shterm/api/authenticate'
+        account = 'huoye.t'
+        password01 = 'Lxygwqf2025.'
+        password02 = 'AA..aa11'
+        key = '316887'
+        data = {'username':account,'password':password01+' '+password02+key}
+        response = requests.post(login_api_url,data,verify=False)
+        token = response.json().get('ST_AUTH_TOKEN')
+        # print('token:'+token)
+        print('----login success----')
+
+def search_ticket():
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    #拿到工单id列表  
+    todolist_api_url = 'https://172.27.57.105/shterm/api/worksheet/todo/list?page=0&size=10'
+    try:
+        headers = {'st-auth-token':token,'Content-Type':'application/json'}
+        response = requests.get(todolist_api_url,headers=headers,verify=False,timeout=5)
+    except Timeout:
+            print("Request time out")
+            pass
+    else: 
+        total = response.json().get('total')
+        if total!=0:
+            for i in range(total):
+                processInstanceIds.append(response.json().get('content',[])[i].get('id'))
+            print(processInstanceIds) 
+            return processInstanceIds
+
+
+            
+def auto_approval():    
+    # 对每个工单id进行审批
+    headers = {'st-auth-token':token,'Content-Type':'application/json'}
+    ticketdetail_api_url = 'https://172.27.57.105/shterm/api/worksheet/instance/detail/'
+    for processInstanceId in processInstanceIds:
+        try:
+            response = requests.get(ticketdetail_api_url+processInstanceId,headers=headers,verify=False,timeout=5)
+        except Timeout:
+            print("Request time out")
+            pass
+        else:
+            start_time = response.json().get('hisTaskFormInfoList',[])[0].get('formInfoList',[])[3].get('value').replace("CST","")
+            end_time = response.json().get('hisTaskFormInfoList',[])[0].get('formInfoList',[])[4].get('value').replace("CST","")
+            date_format = "%a %b %d %H:%M:%S %Y"
+            delta = datetime.strptime(end_time,date_format)-datetime.strptime(start_time,date_format)
+            instance_url = 'https://172.27.57.105/shterm/api/worksheet/instance/detail/' + processInstanceId
+            task_id = requests.get(instance_url,headers=headers,verify=False).json().get('currTaskFormInfo',{}).get('taskId')
+            submit_api_url = 'https://172.27.57.105/shterm/api/worksheet/task/submit/'+ task_id   
+            reject_data = [
+                                {
+                                    "id": "approve",
+                                    "value": "no"
+                                },
+                                 {
+                                    "id": "denyreason",
+                                    "value": "使用时间超过一天"
+                                 }
+                           ]  
+            
+            approve_data = [
+                                {
+                                    "id": "approve",
+                                    "value": "yes"
+                                }, 
+                                {
+                                    "id": "nextLevelApprovers",
+                                    "value": "327,289"
+                                }
+                            ]    
+            if delta.days > 1:
+                print('start to reject:'+processInstanceId)
+                try:
+                     response = requests.post(submit_api_url,json=reject_data,verify=False,headers=headers,timeout=10).text #提交json格式数据只能这样写才能成功
+                    
+                except Timeout:
+                     print("Request time out")
+                     pass
+                else:
+                     print('Done')
+                     
+                   
+            else:
+                print('start to approve:'+processInstanceId)
+                try:
+                    response = requests.post(submit_api_url,json=approve_data,verify=False,headers=headers,timeout=10).text
+                except Timeout:
+                    print("Request time out")
+                    pass
+                else:
+                    print('Done')
+                  
+                    
+        
+                                     
+                            
+                                           
+if __name__ == "__main__":
+    
+    processInstanceIds = []
+    token = None
+    login()
+    while True:
+        search_ticket()
+        if len(processInstanceIds)!= 0:
+            auto_approval()
+            processInstanceIds.clear()
+            print("This round completed")
+            print("["+(datetime.now()).strftime("%Y-%m-%d %H:%M")+"]")
+        else:
+            pass
+    
+        time.sleep(120)
