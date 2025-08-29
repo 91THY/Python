@@ -1,0 +1,89 @@
+# 更新日期：20250813
+# 单次打卡
+# 假勤的control_type更新。不是button了（8月份更新客户端后发现的）
+from pywinauto.application import Application
+from pywinauto import mouse
+import pyautogui
+import random
+import time
+from datetime import datetime
+import datetime 
+import tkinter as tk
+from tkinter import simpledialog
+
+
+def Clock_out():
+    
+    try:
+        app = Application(backend="uia").connect(title = '飞书')
+        time.sleep(2)
+        print('\n')
+        print('Connected')
+    except Exception as e:
+        print('connect to feishu error')
+    feishu_main_window = app.window(title='飞书')
+    #feishu_main_window.print_control_identifiers()
+    attendance_button = feishu_main_window.child_window(title = '假勤',control_type='TabItem')
+    attendance_button.click_input()
+    time.sleep(3)
+    feishu_attendance_window = app.window(title = '假勤')
+    # feishu_attendance_window.print_control_identifiers()
+    clock_out_button = feishu_attendance_window.child_window(title = '下班打卡',control_type='Text')
+    clock_out_button.click_input()
+    print('!Succeeded to clock out!')
+    # print('---' + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + '---')
+
+def Clock_in():
+    
+    try:
+        app = Application(backend="uia").connect(title = '飞书')
+        print('Connected')
+    except Exception as e:
+        print('connect to feishu error')
+    feishu_main_window = app.window(title = '飞书')
+    # feishu_main_window.print_control_identifiers()
+    attendance_button = feishu_main_window.child_window(title = '假勤',control_type='TabItem')
+    attendance_button.click_input()
+    time.sleep(3)
+    feishu_attendance_window = app.window(title = '假勤')
+    # feishu_attendance_window.print_control_identifiers()
+    clock_in_button = feishu_attendance_window.child_window(title = '上班打卡',control_type='Text')
+    clock_in_button.click_input()
+    print('!Succeeded to clock in!')
+    # print('---' + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + '---')
+ 
+
+   
+def move_mouse():
+    width,height = pyautogui.size()
+    x = random.randint(0,width)
+    y = random.randint(0,height)
+    mouse.move(coords=(x,y))
+    
+
+
+
+if __name__ == "__main__":
+
+    
+    target_time_str = "2025-08-29 08:50:31"
+    target_time = datetime.datetime.strptime(target_time_str,"%Y-%m-%d %H:%M:%S")
+    print('Start to run')
+    count = 0
+    while True:
+        current_time = datetime.datetime.now()
+        if current_time >= target_time:
+            Clock_in()
+            break
+        time.sleep(240)
+        move_mouse()
+        count += 1
+        message = f"\r refresh {count} times"
+        print(message,end = "",flush=True)
+        
+    
+  
+
+
+
+    

@@ -1,0 +1,408 @@
+import requests
+from requests_ntlm import HttpNtlmAuth
+import json
+import pandas as pd
+import urllib3
+from urllib.parse import quote
+import getpass
+import time
+from datetime import datetime
+import os
+
+# 禁用SSL警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+class SharePointPermissionAudit:
+    def __init__(self, username, password):
+        self.username = username
+        self.password = password
+        
+    def create_session(self):
+        """创建认证会话"""
+        session = requests.Session()
+        session.auth = HttpNtlmAuth(self.username, self.password)
+        session.verify = False
+        session.headers.update({
+            'Accept': 'application/json;odata=verbose',
+            'Content-Type': 'application/json;odata=verbose'
+        })
+        return session
+    
+    def get_api_data(self, session, site_url, endpoint):
+        """调用SharePoint REST API"""
+        url = f"{site_url}/_api{endpoint}"
+        try:
+            response = session.get(url, timeout=30)
+            response.raise_for_status()
+            return response.json().get('d', {})
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 404:
+                return None
+            else:
+                return None
+        except Exception as e:
+            return None
+    
+    def get_group_users(self, session, site_url, group_id):
+        """获取用户组中的所有用户"""
+        endpoint = f"/web/sitegroups({group_id})/users"
+        data = self.get_api_data(session, site_url, endpoint)
+        
+        users = []
+        if data and 'results' in data:
+            for user in data['results']:
+                users.append({
+                    'LoginName': user.get('LoginName', ''),
+                    'Title': user.get('Title', ''),
+                    'Email': user.get('Email', '')
+                })
+        return users
+    
+    def get_site_permissions(self, session, site_url):
+        """获取站点级权限，并展开用户组中的用户"""
+        endpoint = "/web/RoleAssignments?$expand=Member,RoleDefinitionBindings"
+        data = self.get_api_data(session, site_url, endpoint)
+        
+        permissions = []
+        if data and 'results' in data:
+            for assignment in data['results']:
+                member = assignment.get('Member', {})
+                roles = assignment.get('RoleDefinitionBindings', {}).get('results', [])
+                
+                principal_type = member.get('PrincipalType', '')
+                principal_login = member.get('LoginName', '')
+                
+                # 如果是用户组，获取组内所有用户
+                group_users = []
+                if principal_type == 8:
+                    group_id = member.get('Id', '')
+                    group_users = self.get_group_users(session, site_url, group_id)
+                
+                for role in roles:
+                    # 如果是组，为组内每个用户创建记录
+                    if group_users:
+                        for user in group_users:
+                            permissions.append({
+                                'ObjectType': 'Site',
+                                'ObjectName': 'Root Web',
+                                'ObjectUrl': site_url,
+                                'PrincipalType': 'User',
+                                'PrincipalName': user['Title'],
+                                'PrincipalLogin': user['LoginName'],
+                                'PermissionLevel': role.get('Name', ''),
+                                'PermissionDescription': role.get('Description', ''),
+                                'Inherited': True,
+                                'FromGroup': principal_login
+                            })
+                    else:
+                        # 直接用户权限
+                        permissions.append({
+                            'ObjectType': 'Site',
+                            'ObjectName': 'Root Web',
+                            'ObjectUrl': site_url,
+                            'PrincipalType': member.get('PrincipalType', ''),
+                            'PrincipalName': member.get('Title', member.get('LoginName', '')),
+                            'PrincipalLogin': member.get('LoginName', ''),
+                            'PermissionLevel': role.get('Name', ''),
+                            'PermissionDescription': role.get('Description', ''),
+                            'Inherited': True,
+                            'FromGroup': ''
+                        })
+        
+        return permissions
+    
+    def get_all_lists(self, session, site_url):
+        """获取所有列表和文档库"""
+        endpoint = "/web/lists?$select=Title,Id,BaseTemplate,RootFolder/ServerRelativeUrl&$expand=RootFolder"
+        data = self.get_api_data(session, site_url, endpoint)
+        
+        lists = []
+        if data and 'results' in data:
+            for lst in data['results']:
+                root_folder = lst.get('RootFolder', {})
+                lists.append({
+                    'Title': lst.get('Title', ''),
+                    'Id': lst.get('Id', ''),
+                    'Type': 'Document Library' if lst.get('BaseTemplate') == 101 else 'List',
+                    'Url': f"{site_url}{root_folder.get('ServerRelativeUrl', '')}"
+                })
+        
+        return lists
+    
+    def get_list_permissions(self, session, site_url, list_id, list_title, list_url):
+        """获取列表级权限"""
+        endpoint = f"/web/lists(guid'{list_id}')/RoleAssignments?$expand=Member,RoleDefinitionBindings"
+        data = self.get_api_data(session, site_url, endpoint)
+        
+        permissions = []
+        if data and 'results' in data:
+            for assignment in data['results']:
+                member = assignment.get('Member', {})
+                roles = assignment.get('RoleDefinitionBindings', {}).get('results', [])
+                
+                for role in roles:
+                    permissions.append({
+                        'ObjectType': 'List/Library',
+                        'ObjectName': list_title,
+                        'ObjectUrl': list_url,
+                        'PrincipalType': member.get('PrincipalType', ''),
+                        'PrincipalName': member.get('Title', member.get('LoginName', '')),
+                        'PrincipalLogin': member.get('LoginName', ''),
+                        'PermissionLevel': role.get('Name', ''),
+                        'PermissionDescription': role.get('Description', ''),
+                        'Inherited': False,
+                        'FromGroup': ''
+                    })
+        
+        return permissions
+    
+    def get_folder_permissions(self, session, site_url, folder_url, parent_name):
+        """获取文件夹级权限"""
+        # 跳过系统文件夹
+        if folder_url.endswith('/Forms') or '/Forms/' in folder_url:
+            return []
+        
+        encoded_url = quote(folder_url, safe='')
+        endpoint = f"/web/GetFolderByServerRelativeUrl('{encoded_url}')/ListItemAllFields/RoleAssignments?$expand=Member,RoleDefinitionBindings"
+        
+        data = self.get_api_data(session, site_url, endpoint)
+        
+        # 如果返回404，尝试另一种方法
+        if data is None:
+            return self.get_folder_permissions_alternative(session, site_url, folder_url, parent_name)
+        
+        permissions = []
+        if data and 'results' in data:
+            for assignment in data['results']:
+                member = assignment.get('Member', {})
+                roles = assignment.get('RoleDefinitionBindings', {}).get('results', [])
+                
+                for role in roles:
+                    permissions.append({
+                        'ObjectType': 'Folder',
+                        'ObjectName': folder_url.split('/')[-1],
+                        'ObjectUrl': f"{site_url}{folder_url}",
+                        'ParentObject': parent_name,
+                        'PrincipalType': member.get('PrincipalType', ''),
+                        'PrincipalName': member.get('Title', member.get('LoginName', '')),
+                        'PrincipalLogin': member.get('LoginName', ''),
+                        'PermissionLevel': role.get('Name', ''),
+                        'PermissionDescription': role.get('Description', ''),
+                        'Inherited': False,
+                        'FromGroup': ''
+                    })
+        
+        return permissions
+    
+    def get_folder_permissions_alternative(self, session, site_url, folder_url, parent_name):
+        """替代方法获取文件夹权限"""
+        try:
+            encoded_url = quote(folder_url, safe='')
+            endpoint = f"/web/GetFolderByServerRelativeUrl('{encoded_url}')?$select=*,HasUniqueRoleAssignments"
+            
+            data = self.get_api_data(session, site_url, endpoint)
+            if data and data.get('HasUniqueRoleAssignments', False):
+                return [{
+                    'ObjectType': 'Folder',
+                    'ObjectName': folder_url.split('/')[-1],
+                    'ObjectUrl': f"{site_url}{folder_url}",
+                    'ParentObject': parent_name,
+                    'PrincipalType': 'Unknown',
+                    'PrincipalName': '需要手动检查',
+                    'PrincipalLogin': 'manual_check_required',
+                    'PermissionLevel': '独立权限（需手动验证）',
+                    'PermissionDescription': '该文件夹有独立权限，但API无法获取详细信息',
+                    'Inherited': False,
+                    'FromGroup': ''
+                }]
+            else:
+                return []
+                
+        except Exception as e:
+            return []
+    
+    def get_folders_in_library(self, session, site_url, library_url):
+        """获取文档库中的所有文件夹"""
+        encoded_url = quote(library_url, safe='')
+        endpoint = f"/web/GetFolderByServerRelativeUrl('{encoded_url}')/Folders"
+        data = self.get_api_data(session, site_url, endpoint)
+        
+        folders = []
+        if data and 'results' in data:
+            for folder in data['results']:
+                folder_url = folder.get('ServerRelativeUrl', '')
+                if not folder_url.endswith('/Forms') and '/Forms/' not in folder_url:
+                    folders.append(folder_url)
+        
+        return folders
+    
+    def get_site_permissions_data(self, site_url, include_folders=True, max_folders_per_library=10):
+        """获取单个站点的所有权限信息"""
+        session = self.create_session()
+        all_permissions = []
+        
+        # 1. 获取站点权限
+        site_permissions = self.get_site_permissions(session, site_url)
+        all_permissions.extend(site_permissions)
+        
+        # 2. 获取所有列表和文档库
+        lists = self.get_all_lists(session, site_url)
+        
+        # 3. 获取每个列表的权限
+        for lst in lists:
+            list_permissions = self.get_list_permissions(session, site_url, lst['Id'], lst['Title'], lst['Url'])
+            all_permissions.extend(list_permissions)
+            
+            # 4. 如果是文档库，获取文件夹权限
+            if include_folders and lst['Type'] == 'Document Library':
+                library_path = lst['Url'].replace(site_url, '')
+                folders = self.get_folders_in_library(session, site_url, library_path)
+                
+                folders = folders[:max_folders_per_library]
+                
+                for folder_url in folders:
+                    folder_permissions = self.get_folder_permissions(session, site_url, folder_url, lst['Title'])
+                    all_permissions.extend(folder_permissions)
+                    time.sleep(0.1)
+        
+        # 关闭会话
+        session.close()
+        return all_permissions
+    
+    def generate_filename(self, site_url):
+        """生成CSV文件名"""
+        current_time = datetime.now().strftime("%Y%m%d_%H%M")
+        site_name = site_url.rstrip('/').split('/')[-1]
+        if not site_name:
+            site_name = site_url.rstrip('/').split('/')[-2]
+        filename = f"{current_time}_{site_name}_permissions.csv"
+        return filename
+    
+    def export_to_csv(self, permissions, filename):
+        """导出到CSV文件"""
+        if not permissions:
+            return False
+        
+        df = pd.DataFrame(permissions)
+        
+        columns_to_keep = [
+            'ObjectType',
+            'ObjectName',
+            'PrincipalName',
+            'PermissionLevel',
+            'Inherited',
+            'FromGroup'
+        ]
+        
+        df_filtered = df[columns_to_keep]
+        df_filtered.to_csv(filename, index=False, encoding='utf-8-sig')
+        
+        # 返回统计信息
+        stats = {
+            'total_records': len(permissions),
+            'site_permissions': len(df[df['ObjectType'] == 'Site']),
+            'list_permissions': len(df[df['ObjectType'] == 'List/Library']),
+            'folder_permissions': len(df[df['ObjectType'] == 'Folder']),
+            'unique_users': df['PrincipalLogin'].nunique()
+        }
+        
+        return stats
+
+def main():
+    # 配置信息
+    username = "spadmin"
+    password = "Host#pite2022"
+    
+    # 定义要审计的站点列表
+    site_urls = [
+        "https://ksp.kasikornbank.com.cn/sites/IT",
+        "https://ksp.kasikornbank.com.cn/sites/ERM"
+    ]
+    
+    # 创建审计实例
+    auditor = SharePointPermissionAudit(username, password)
+    
+    # 创建输出目录
+    output_dir = "sharepoint_permissions_audit"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # 遍历所有站点并获取权限
+    successful_sites = []
+    failed_sites = []
+    
+    print("开始SharePoint权限审计...")
+    print("=" * 50)
+    
+    for i, site_url in enumerate(site_urls, 1):
+        try:
+            print(f"[{i}/{len(site_urls)}] 正在处理站点: {site_url}")
+            
+            # 获取站点权限数据
+            all_permissions = auditor.get_site_permissions_data(
+                site_url,
+                include_folders=True,
+                max_folders_per_library=8
+            )
+            
+            if all_permissions:
+                # 生成文件名
+                filename = auditor.generate_filename(site_url)
+                filepath = os.path.join(output_dir, filename)
+                
+                # 导出到CSV并获取统计信息
+                stats = auditor.export_to_csv(all_permissions, filepath)
+                
+                if stats:
+                    print(f"   ✓ 成功导出: {filename}")
+                    print(f"     总记录: {stats['total_records']} | "
+                          f"站点权限: {stats['site_permissions']} | "
+                          f"列表权限: {stats['list_permissions']} | "
+                          f"文件夹权限: {stats['folder_permissions']} | "
+                          f"涉及用户: {stats['unique_users']}")
+                    successful_sites.append((site_url, stats))
+                else:
+                    print(f"   ✗ 导出失败")
+                    failed_sites.append(site_url)
+            else:
+                print(f"   ✗ 未获取到权限数据")
+                failed_sites.append(site_url)
+                
+        except Exception as e:
+            print(f"   ✗ 处理失败: {str(e)}")
+            failed_sites.append(site_url)
+        
+        # 站点间延迟
+        if i < len(site_urls):
+            time.sleep(2)
+    
+    # 输出最终统计
+    print("\n" + "=" * 50)
+    print("审计完成总结")
+    print("=" * 50)
+    
+    if successful_sites:
+        total_records = sum(stats['total_records'] for _, stats in successful_sites)
+        total_site_perms = sum(stats['site_permissions'] for _, stats in successful_sites)
+        total_list_perms = sum(stats['list_permissions'] for _, stats in successful_sites)
+        total_folder_perms = sum(stats['folder_permissions'] for _, stats in successful_sites)
+        
+        print(f"成功处理 {len(successful_sites)} 个站点:")
+        for site_url, stats in successful_sites:
+            print(f"  ✓ {site_url}")
+        
+        print(f"\n总计统计:")
+        print(f"  总权限记录: {total_records}")
+        print(f"  站点级权限: {total_site_perms}")
+        print(f"  列表级权限: {total_list_perms}")
+        print(f"  文件夹权限: {total_folder_perms}")
+    
+    if failed_sites:
+        print(f"\n处理失败 {len(failed_sites)} 个站点:")
+        for site_url in failed_sites:
+            print(f"  ✗ {site_url}")
+    
+    print(f"\n所有文件已保存到: {os.path.abspath(output_dir)}")
+
+if __name__ == "__main__":
+    main()
